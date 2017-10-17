@@ -444,6 +444,17 @@ func resourceIBMComputeBareMetalCreate(d *schema.ResourceData, meta interface{})
 			return fmt.Errorf(
 				"Encountered problem trying to get the bare metal order template: %s", err)
 		}
+		items, err := product.GetPackageProducts(sess, *order.PackageId, "id,categories,description,keyName,prices[id,categories[id,name,categoryCode]]")
+		if err != nil {
+			return err
+		}
+		// Add redundant power supply
+		powerSupply, err := getItemPriceId(items, "power_supply", "REDUNDANT_POWER_SUPPLY")
+		if err != nil {
+			return err
+		}
+		order.Prices = append(order.Prices, powerSupply)
+
 	} else {
 		// Build a monthly bare metal server template
 		order, err = getMonthlyBareMetalOrder(d, meta)
