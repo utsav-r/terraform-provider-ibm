@@ -273,3 +273,14 @@ func validateSecurityRuleProtocol(v interface{}, k string) (ws []string, errors 
 	}
 	return
 }
+
+func validateNamespace(v interface{}, k string) (ws []string, errors []error) {
+	ns := v.(string)
+	orgSpace := strings.Split(ns, "_")
+	if len(orgSpace) != 2 {
+		errors = append(errors, fmt.Errorf(
+			"%q  must be of the form <org>_<space>, provider can't find the auth key if you use _ as well", k))
+	}
+	return
+
+}

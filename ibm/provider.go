@@ -51,6 +51,13 @@ func Provider() terraform.ResourceProvider {
 				Description: "The timeout (in seconds) to set for any SoftLayer API calls made.",
 				DefaultFunc: schema.MultiEnvDefaultFunc([]string{"SL_TIMEOUT", "SOFTLAYER_TIMEOUT"}, 60),
 			},
+			"openwhisk_namespace": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Description:  "The Openwhisk namespace",
+				ValidateFunc: validateNamespace,
+				DefaultFunc:  schema.MultiEnvDefaultFunc([]string{"WSK_NAMESPACE", "OPENWHISK_NAMESPACE"}, ""),
+			},
 			"max_retries": {
 				Type:        schema.TypeInt,
 				Optional:    true,
@@ -141,6 +148,7 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 	bluemixTimeout := d.Get("bluemix_timeout").(int)
 	region := d.Get("region").(string)
 	retryCount := d.Get("max_retries").(int)
+	wskNameSpace := d.Get("openwhisk_namespace").(string)
 
 	config := Config{
 		BluemixAPIKey:        bluemixAPIKey,
@@ -152,6 +160,7 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 		RetryCount:           retryCount,
 		SoftLayerEndpointURL: SoftlayerRestEndpoint,
 		RetryDelay:           RetryAPIDelay,
+		OpenWhiskNameSpace:   wskNameSpace,
 	}
 
 	return config.ClientSession()

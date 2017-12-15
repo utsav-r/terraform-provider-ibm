@@ -9,6 +9,7 @@ import (
 
 	gohttp "net/http"
 
+	"github.com/apache/incubator-openwhisk-client-go/whisk"
 	jwt "github.com/dgrijalva/jwt-go"
 
 	slsession "github.com/softlayer/softlayer-go/session"
@@ -68,6 +69,9 @@ type Config struct {
 	// Softlayer API Key
 	SoftLayerAPIKey string
 
+	// OpenWhiskNameSpace ...
+	OpenWhiskNameSpace string
+
 	//Retry Count for API calls
 	//Unexposed in the schema at this point as they are used only during session creation for a few calls
 	//When sdk implements it we an expose them for expected behaviour
@@ -96,6 +100,7 @@ type ClientSession interface {
 	BluemixAcccountAPI() (accountv2.AccountServiceAPI, error)
 	BluemixAcccountv1API() (accountv1.AccountServiceAPI, error)
 	BluemixUserDetails() (*UserConfig, error)
+	OpenWhiskClient() (*whisk.Client, error)
 }
 
 type clientSession struct {
@@ -118,6 +123,9 @@ type clientSession struct {
 
 	bmxUserDetails  *UserConfig
 	bmxUserFetchErr error
+
+	wskConfigErr    error
+	openWhiskClient *whisk.Client
 }
 
 // SoftLayerSession providers SoftLayer Session
@@ -160,6 +168,11 @@ func (sess clientSession) BluemixUserDetails() (*UserConfig, error) {
 	return sess.bmxUserDetails, sess.bmxUserFetchErr
 }
 
+// OpenWhiskClient ...
+func (sess clientSession) OpenWhiskClient() (*whisk.Client, error) {
+	return sess.openWhiskClient, sess.wskConfigErr
+}
+
 // ClientSession configures and returns a fully initialized ClientSession
 func (c *Config) ClientSession() (interface{}, error) {
 	sess, err := newSession(c)
@@ -178,6 +191,7 @@ func (c *Config) ClientSession() (interface{}, error) {
 		session.accountConfigErr = errEmptyBluemixCredentials
 		session.accountV1ConfigErr = errEmptyBluemixCredentials
 		session.iamConfigErr = errEmptyBluemixCredentials
+		session.wskConfigErr = errEmptyBluemixCredentials
 		return session, nil
 	}
 
@@ -185,6 +199,11 @@ func (c *Config) ClientSession() (interface{}, error) {
 	if err != nil {
 		session.bmxUserFetchErr = fmt.Errorf("Error occured while fetching account user details: %q", err)
 	}
+
+	session.openWhiskClient, session.wskConfigErr = whiskClient(sess.BluemixSession.Config, c.OpenWhiskNameSpace)
+	//Why?
+	sess.BluemixSession.Config.UAAAccessToken = ""
+	sess.BluemixSession.Config.UAARefreshToken = ""
 
 	session.bmxUserDetails = userConfig
 
@@ -271,8 +290,6 @@ func fetchUserDetails(sess *bxsession.Session) (*UserConfig, error) {
 		return &user, err
 	}
 	bluemixToken := config.IAMAccessToken[7:len(config.IAMAccessToken)]
-	config.UAAAccessToken = ""
-	config.UAARefreshToken = ""
 	token, err := jwt.Parse(bluemixToken, func(token *jwt.Token) (interface{}, error) {
 		if err != nil {
 			return nil, err
