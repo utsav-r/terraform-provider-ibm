@@ -1,6 +1,7 @@
 package ibm
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform/helper/hashcode"
 	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/softlayer/softlayer-go/datatypes"
@@ -242,6 +244,7 @@ func resourceIBMNetworkGateway() *schema.Resource {
 						},
 					},
 				},
+				Set: resourceIBMNetworkGatewayMemberHash,
 			},
 
 			"associated_vlans": {
@@ -868,19 +871,6 @@ func resourceIBMNetworkGatewayVlanDissociate(d *schema.ResourceData, meta interf
 	return nil
 }
 
-func resourceIBMNetworkGatewayVlanAssociatedReader(d *schema.ResourceData, meta interface{}) interface{} {
-	sess := meta.(ClientSession).SoftLayerSession()
-	networkGatewayID := d.Get("networkGatewayId").(int)
-	allgateways, err := services.GetNetworkGatewayService(sess).GetInsideVlans()
-	if err != nil {
-		return fmt.Errorf(
-			"Encountered problem trying to read the VLANs associated with  %d : %s", networkGatewayID, err)
-	}
-
-	return allgateways
-
-}
-
 func setTagsAndNotes(m gatewayMember, meta interface{}) error {
 	err := setHardwareTags(m["member_id"].(int), m, meta)
 	if err != nil {
@@ -894,6 +884,13 @@ func setTagsAndNotes(m gatewayMember, meta interface{}) error {
 		}
 	}
 	return nil
+}
+
+func resourceIBMNetworkGatewayMemberHash(v interface{}) int {
+	var buf bytes.Buffer
+	m := v.(map[string]interface{})
+	buf.WriteString(fmt.Sprintf("%s-%s", m["hostname"].(string), m["domain"].(string)))
+	return hashcode.String(buf.String())
 }
 
 //New types to resuse functions from other resources which does the same job
