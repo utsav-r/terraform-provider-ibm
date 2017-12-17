@@ -47,6 +47,10 @@ func resourceIBMNetworkGateway() *schema.Resource {
 				MaxItems:    2,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
+						"member_id": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
 						"hostname": {
 							Type:        schema.TypeString,
 							Optional:    true,
@@ -74,6 +78,7 @@ func resourceIBMNetworkGateway() *schema.Resource {
 						"notes": {
 							Type:     schema.TypeString,
 							Optional: true,
+							ForceNew: true,
 						},
 
 						"datacenter": {
@@ -119,7 +124,12 @@ func resourceIBMNetworkGateway() *schema.Resource {
 							Default:  false,
 							ForceNew: true,
 						},
-
+						"tags": {
+							Type:     schema.TypeSet,
+							Optional: true,
+							Elem:     &schema.Schema{Type: schema.TypeString},
+							Set:      schema.HashString,
+						},
 						"unbonded_network": {
 							Type:     schema.TypeBool,
 							Optional: true,
@@ -327,7 +337,7 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 			"Encountered problem trying to place the order: %s", err)
 	}
 
-	bm, err := waitForNetworkGatewayProvision(&order.Hardware[0], meta)
+	bm, err := waitForNetworkGatewayMemberProvision(&order.Hardware[0], meta)
 	if err != nil {
 		return fmt.Errorf(
 			"Error waiting for Gateway (%s) to become ready: %s", d.Id(), err)
@@ -338,42 +348,31 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 	log.Printf("[INFO] Gateway ID: %s", d.Id())
 
 	member1Id := *bm.(datatypes.Hardware).Id
-
-	// Set tags on member 1
-	err = setHardwareTags(member1Id, members[0], meta)
-	if err != nil {
-		return err
-	}
-
-	// Set notes on member 1
-	if d.Get("notes").(string) != "" {
-		err = setHardwareNotes(member1Id, members[0], meta)
-		if err != nil {
-			return err
-		}
-	}
+	log.Printf("[INFO] Member 1 ID: %d", member1Id)
 
 	if equalConf {
-		bm, err := waitForNetworkGatewayProvision(&order.Hardware[1], meta)
+		bm, err := waitForNetworkGatewayMemberProvision(&order.Hardware[1], meta)
 		if err != nil {
 			return fmt.Errorf(
 				"Error waiting for Gateway (%s) to become ready: %s", d.Id(), err)
 		}
 
 		member2Id := *bm.(datatypes.Hardware).Id
-		// Set tags on member 1
-		err = setHardwareTags(member2Id, members[1], meta)
-		if err != nil {
-			return err
-		}
 
-		// Set notes on member 1
-		if d.Get("notes").(string) != "" {
-			err = setHardwareNotes(member2Id, members[1], meta)
-			if err != nil {
-				return err
-			}
-		}
+		log.Printf("[INFO] Member 2 ID: %d", member2Id)
+		// // Set tags on member 1
+		// err = setHardwareTags(member2Id, members[1], meta)
+		// if err != nil {
+		// 	return err
+		// }
+
+		// // Set notes on member 1
+		// if d.Get("notes").(string) != "" {
+		// 	err = setHardwareNotes(member2Id, members[1], meta)
+		// 	if err != nil {
+		// 		return err
+		// 	}
+		// }
 
 	}
 
@@ -485,17 +484,70 @@ func resourceIBMNetworkGatewayRead(d *schema.ResourceData, meta interface{}) err
 
 func resourceIBMNetworkGatewayUpdate(d *schema.ResourceData, meta interface{}) error {
 	id, _ := strconv.Atoi(d.Id())
-	if d.HasChange("tags") {
-		err := setHardwareTags(id, d, meta)
+	sess := meta.(ClientSession).SoftLayerSession()
+	if d.HasChange("name") {
+		service := services.GetNetworkGatewayService(sess)
+		gwName := d.Get("name").(string)
+		_, err := service.Id(id).EditObject(&datatypes.Network_Gateway{
+			Name: sl.String(gwName),
+		})
 		if err != nil {
-			return err
+			return fmt.Errorf("Couldn't set the gateway name to %s", gwName)
 		}
 	}
 
-	if d.HasChange("notes") {
-		err := setHardwareNotes(id, d, meta)
-		if err != nil {
-			return err
+	if d.HasChange("members") {
+		o, n := d.GetChange("members")
+		os := o.(*schema.Set)
+		ns := n.(*schema.Set)
+
+		add := ns.Difference(os).List()
+		for _, v := range add {
+			member := v.(gatewayMember)
+			order, err := getMonthlyGatewayOrder(member, meta)
+			if err != nil {
+				return fmt.Errorf(
+					"Encountered problem trying to get the Gateway order template: %s", err)
+			}
+			err = setHardwareOptions(member, &order.Hardware[0])
+			if err != nil {
+				return fmt.Errorf(
+					"Encountered problem trying to configure Gateway options: %s", err)
+			}
+			order.ResourceGroupId = sl.Int(id)
+
+			var ProductOrder datatypes.Container_Product_Order
+			ProductOrder.OrderContainers = make([]datatypes.Container_Product_Order, 1)
+			ProductOrder.OrderContainers[0] = order
+
+			_, err = services.GetProductOrderService(sess).VerifyOrder(&ProductOrder)
+			if err != nil {
+				return fmt.Errorf(
+					"Encountered problem trying to verify the order: %s", err)
+			}
+			//os.Exit(1)
+			_, err = services.GetProductOrderService(sess).PlaceOrder(&ProductOrder, sl.Bool(false))
+			if err != nil {
+				return fmt.Errorf(
+					"Encountered problem trying to place the order: %s", err)
+			}
+
+			bm, err := waitForNetworkGatewayMemberProvision(&order.Hardware[0], meta)
+			if err != nil {
+				return fmt.Errorf(
+					"Error waiting for Gateway (%s) to become ready: %s", d.Id(), err)
+			}
+
+		}
+
+		rem := os.Difference(ns).List()
+		for _, v := range rem {
+			member := v.(gatewayMember)
+			log.Println("Removing member with ID", member.Id())
+			err := resourceIBMComputeBareMetalDelete(member, meta)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -503,12 +555,20 @@ func resourceIBMNetworkGatewayUpdate(d *schema.ResourceData, meta interface{}) e
 		o, n := d.GetChange("associated_vlans")
 		os := o.(*schema.Set)
 		ns := n.(*schema.Set)
-
 		add := expandVlans(ns.Difference(os).List(), id)
-		resourceIBMNetworkGatewayVlanAssociate(d, meta, add, id)
-
+		if len(add) > 0 {
+			err := resourceIBMNetworkGatewayVlanAssociate(d, meta, add, id)
+			if err != nil {
+				return err
+			}
+		}
 		rem := expandVlans(os.Difference(ns).List(), id)
-		resourceIBMNetworkGatewayVlanDissociate(d, meta, rem, id)
+		if len(rem) > 0 {
+			err := resourceIBMNetworkGatewayVlanDissociate(d, meta, rem, id)
+			if err != nil {
+				return err
+			}
+		}
 
 	}
 
@@ -818,7 +878,7 @@ func waitForNoGatewayActiveTransactions(id int, meta interface{}) (interface{}, 
 // Have to wait on provision date to become available on server that matches
 // hostname and domain.
 // http://sldn.softlayer.com/blog/bpotter/ordering-bare-metal-servers-using-softlayer-api
-func waitForNetworkGatewayProvision(d *datatypes.Hardware, meta interface{}) (interface{}, error) {
+func waitForNetworkGatewayMemberProvision(d *datatypes.Hardware, meta interface{}) (interface{}, error) {
 	hostname := *d.Hostname
 	domain := *d.Domain
 	log.Printf("Waiting for Gateway (%s.%s) to be provisioned", hostname, domain)
@@ -859,7 +919,7 @@ func expandVlans(configured []interface{}, id int) []datatypes.Network_Gateway_V
 	for _, lRaw := range configured {
 		data := lRaw.(map[string]interface{})
 		p := &datatypes.Network_Gateway_Vlan{}
-		if v, ok := data["networkVlanID"]; ok && v.(int) != 0 {
+		if v, ok := data["network_vlan_id"]; ok && v.(int) != 0 {
 			p.NetworkVlanId = sl.Int(v.(int))
 		}
 		if v, ok := data["bypass"]; ok {
@@ -906,10 +966,11 @@ func resourceIBMNetworkGatewayVlanAssociatedReader(d *schema.ResourceData, meta 
 
 }
 
-//New types to resuse functions which fetch price ids in bare metal and gateway order
+//New types to resuse functions from other resources which does the same job
 type dataRetriever interface {
 	Get(string) interface{}
 	GetOk(string) (interface{}, bool)
+	Id() string
 }
 type gatewayMember map[string]interface{}
 
@@ -923,4 +984,8 @@ func (m gatewayMember) Get(k string) interface{} {
 func (m gatewayMember) GetOk(k string) (i interface{}, b bool) {
 	i, b = m[k]
 	return
+}
+
+func (m gatewayMember) Id() string {
+	return strconv.Itoa(m["member_id"].(int))
 }

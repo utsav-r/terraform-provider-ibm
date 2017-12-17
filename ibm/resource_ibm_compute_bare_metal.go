@@ -745,7 +745,7 @@ func resourceIBMComputeBareMetalUpdate(d *schema.ResourceData, meta interface{})
 	return nil
 }
 
-func resourceIBMComputeBareMetalDelete(d *schema.ResourceData, meta interface{}) error {
+func resourceIBMComputeBareMetalDelete(d dataRetriever, meta interface{}) error {
 	sess := meta.(ClientSession).SoftLayerSession()
 	service := services.GetHardwareService(sess)
 	id, err := strconv.Atoi(d.Id())
