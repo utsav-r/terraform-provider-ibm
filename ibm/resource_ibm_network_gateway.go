@@ -250,6 +250,10 @@ func resourceIBMNetworkGateway() *schema.Resource {
 				Optional:    true,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
+						"vlan_id": {
+							Type:     schema.TypeInt,
+							Computed: true,
+						},
 						"network_vlan_id": {
 							Type:        schema.TypeInt,
 							Description: "The Identifier of the VLAN to be associated",
@@ -375,97 +379,29 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 }
 
 func resourceIBMNetworkGatewayRead(d *schema.ResourceData, meta interface{}) error {
-	service := services.GetHardwareService(meta.(ClientSession).SoftLayerSession())
-
+	service := services.GetNetworkGatewayService(meta.(ClientSession).SoftLayerSession())
 	id, err := strconv.Atoi(d.Id())
 	if err != nil {
 		return fmt.Errorf("Not a valid ID, must be an integer: %s", err)
 	}
-
 	result, err := service.Id(id).Mask(
-		"hostname,domain," +
-			"primaryIpAddress,primaryBackendIpAddress,privateNetworkOnlyFlag," +
-			"notes,userData[value],tagReferences[id,tag[name]]," +
-			"datacenter[id,name,longName]," +
-			"primaryNetworkComponent[networkVlan[id,primaryRouter,vlanNumber],maxSpeed]," +
-			"primaryBackendNetworkComponent[networkVlan[id,primaryRouter,vlanNumber],maxSpeed,redundancyEnabledFlag]," +
-			"networkGatewayMember[networkGatewayId]," +
-			"memoryCapacity,powerSupplyCount",
+		"insideVlans,members," +
+			"members[hardware],members[hardware[datacenter]]," +
+			"members[hardware[primaryNetworkComponent]],members[hardware[backendNetworkComponents]]," +
+			"members[hardware[primaryBackendNetworkComponent]],members[hardware[primaryBackendNetworkComponent[redundancyEnabledFlag]]]," +
+			"members[hardware[tagReferences]],members[hardware[primaryIpAddress]],members[hardware[primaryBackendIpAddress]]," +
+			"members[hardware[primaryNetworkComponent[primaryVersion6IpAddressRecord]]],members[hardware[privateNetworkOnlyFlag]]," +
+			"members[hardware[powerSupplyCount]],members[hardware[primaryNetworkComponent[networkVlan]]],members[hardware[memoryCapacity]]",
 	).GetObject()
-
 	if err != nil {
 		return fmt.Errorf("Error retrieving Network Gateway: %s", err)
 	}
-
-	d.Set("hostname", *result.Hostname)
-	d.Set("domain", *result.Domain)
-	if result.NetworkGatewayMember != nil {
-		d.Set("networkGatewayId", *result.NetworkGatewayMember.NetworkGatewayId)
-	}
-
-	if result.Datacenter != nil {
-		d.Set("datacenter", *result.Datacenter.Name)
-	}
-
-	d.Set("network_speed", *result.PrimaryNetworkComponent.MaxSpeed)
-	if result.PrimaryIpAddress != nil {
-		d.Set("public_ipv4_address", *result.PrimaryIpAddress)
-	}
-	d.Set("private_ipv4_address", *result.PrimaryBackendIpAddress)
-
-	d.Set("private_network_only", *result.PrivateNetworkOnlyFlag)
-
-	if result.PrimaryNetworkComponent.NetworkVlan != nil {
-		d.Set("public_vlan_id", *result.PrimaryNetworkComponent.NetworkVlan.Id)
-	}
-
-	if result.PrimaryBackendNetworkComponent.NetworkVlan != nil {
-		d.Set("private_vlan_id", *result.PrimaryBackendNetworkComponent.NetworkVlan.Id)
-	}
-
-	d.Set("notes", sl.Get(result.Notes, nil))
-	d.Set("memory", *result.MemoryCapacity)
-
-	d.Set("redundant_network", false)
-	d.Set("unbonded_network", false)
-
-	backendNetworkComponent, err := service.Filter(
-		filter.Build(
-			filter.Path("backendNetworkComponents.status").Eq("ACTIVE"),
-		),
-	).Id(id).GetBackendNetworkComponents()
-
+	d.Set("name", result.Name)
+	err = d.Set("members", flattenGatewayMembers(d, result.Members))
 	if err != nil {
-		return fmt.Errorf("Error retrieving Network Gateway network: %s", err)
+		return err
 	}
-
-	if len(backendNetworkComponent) > 2 && result.PrimaryBackendNetworkComponent != nil {
-		if *result.PrimaryBackendNetworkComponent.RedundancyEnabledFlag {
-			d.Set("redundant_network", true)
-		} else {
-			d.Set("unbonded_network", true)
-		}
-	}
-
-	tagReferences := result.TagReferences
-	tagReferencesLen := len(tagReferences)
-	if tagReferencesLen > 0 {
-		tags := make([]string, 0, tagReferencesLen)
-		for _, tagRef := range tagReferences {
-			tags = append(tags, *tagRef.Tag.Name)
-		}
-		d.Set("tags", tags)
-	}
-
-	// connInfo := map[string]string{"type": "ssh"}
-	// if !*result.PrivateNetworkOnlyFlag && result.PrimaryIpAddress != nil {
-	// 	connInfo["host"] = *result.PrimaryIpAddress
-	// } else {
-	// 	connInfo["host"] = *result.PrimaryBackendIpAddress
-	// }
-	// d.SetConnInfo(connInfo)
-	// where to set it
-	d.Set("associated_vlans", resourceIBMNetworkGatewayVlanAssociatedReader(d, meta))
+	d.Set("associated_vlans", flattenGatewayVlans(result.InsideVlans))
 
 	return nil
 }
@@ -513,7 +449,6 @@ func resourceIBMNetworkGatewayUpdate(d *schema.ResourceData, meta interface{}) e
 				return fmt.Errorf(
 					"Encountered problem trying to verify the order: %s", err)
 			}
-			//os.Exit(1)
 			_, err = services.GetProductOrderService(sess).PlaceOrder(&ProductOrder, sl.Bool(false))
 			if err != nil {
 				return fmt.Errorf(
@@ -566,8 +501,7 @@ func resourceIBMNetworkGatewayUpdate(d *schema.ResourceData, meta interface{}) e
 		}
 
 	}
-
-	return nil
+	return resourceIBMNetworkGatewayRead(d, meta)
 }
 
 func resourceIBMNetworkGatewayDelete(d *schema.ResourceData, meta interface{}) error {
@@ -593,7 +527,7 @@ func resourceIBMNetworkGatewayDelete(d *schema.ResourceData, meta interface{}) e
 }
 
 func resourceIBMNetworkGatewayExists(d *schema.ResourceData, meta interface{}) (bool, error) {
-	service := services.GetHardwareService(meta.(ClientSession).SoftLayerSession())
+	service := services.GetNetworkGatewayService(meta.(ClientSession).SoftLayerSession())
 
 	id, err := strconv.Atoi(d.Id())
 	if err != nil {
@@ -977,8 +911,8 @@ func (m gatewayMember) Get(k string) interface{} {
 	}
 	return m[k]
 }
-func (m gatewayMember) GetOk(k string) (i interface{}, b bool) {
-	i, b = m[k]
+func (m gatewayMember) GetOk(k string) (i interface{}, ok bool) {
+	i, ok = m[k]
 	return
 }
 

@@ -2,6 +2,7 @@ package ibm
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/IBM-Bluemix/bluemix-go/api/container/containerv1"
 	"github.com/IBM-Bluemix/bluemix-go/api/iampap/iampapv1"
@@ -328,4 +329,104 @@ func flattenVlans(list []containerv1.Vlan) []map[string]interface{} {
 		vlans[i] = l
 	}
 	return vlans
+}
+
+func flattenGatewayVlans(list []datatypes.Network_Gateway_Vlan) []map[string]interface{} {
+	vlans := make([]map[string]interface{}, len(list))
+	for i, ele := range list {
+		vlan := make(map[string]interface{})
+		vlan["bypass"] = *ele.BypassFlag
+		vlan["network_vlan_id"] = *ele.NetworkVlanId
+		vlan["vlan_id"] = *ele.Id
+		vlans[i] = vlan
+	}
+	return vlans
+}
+
+//We need schema.ResourceData to tell us if the user config already got members so that we can populate the right
+//members based on the member_id. This is required since we can't read back all the info of the gateway members
+//like process_key_name etc
+func flattenGatewayMembers(d *schema.ResourceData, list []datatypes.Network_Gateway_Member) []map[string]interface{} {
+	members := make([]map[string]interface{}, len(list))
+
+	membersInState := []map[string]interface{}{}
+	for _, v := range d.Get("members").(*schema.Set).List() {
+		m := v.(map[string]interface{})
+		membersInState = append(membersInState, m)
+	}
+
+	for i, ele := range list {
+		hardware := *ele.Hardware
+		member := make(map[string]interface{})
+		matchingMemberInState := map[string]interface{}{}
+		for _, v := range membersInState {
+			if v["hostname"] == *hardware.Hostname && v["domain"] == *hardware.Domain {
+				matchingMemberInState = v
+				processKeyName, ok := matchingMemberInState["process_key_name"]
+				if ok {
+					log.Println(processKeyName.(string))
+				}
+			}
+		}
+		//For values that can't be read back, leave it as it is user configuration
+		// matchingMemberInState has all the user config
+		log.Println(matchingMemberInState)
+
+		member["member_id"] = *ele.HardwareId
+		member["hostname"] = *hardware.Hostname
+		member["domain"] = *hardware.Domain
+		if hardware.Notes != nil {
+			member["notes"] = *hardware.Notes
+		}
+		if hardware.Datacenter != nil {
+			member["datacenter"] = *hardware.Datacenter.Name
+		}
+		if hardware.PrimaryNetworkComponent.MaxSpeed != nil {
+			member["network_speed"] = *hardware.PrimaryNetworkComponent.MaxSpeed
+		}
+		member["redundant_network"] = false
+		member["unbonded_network"] = false
+		backendNetworkComponent := ele.Hardware.BackendNetworkComponents
+
+		if len(backendNetworkComponent) > 2 && ele.Hardware.PrimaryBackendNetworkComponent != nil {
+			if *hardware.PrimaryBackendNetworkComponent.RedundancyEnabledFlag {
+				member["redundant_network"] = true
+			} else {
+				member["unbonded_network"] = true
+			}
+		}
+		tagReferences := ele.Hardware.TagReferences
+		tagReferencesLen := len(tagReferences)
+		if tagReferencesLen > 0 {
+			tags := make([]interface{}, 0, tagReferencesLen)
+			for _, tagRef := range tagReferences {
+				tags = append(tags, *tagRef.Tag.Name)
+			}
+			member["tags"] = schema.NewSet(schema.HashString, tags)
+		}
+
+		member["memory"] = *hardware.MemoryCapacity
+		if ele.Hardware.PrimaryNetworkComponent.NetworkVlan != nil {
+			member["public_vlan_id"] = *hardware.PrimaryNetworkComponent.NetworkVlan.Id
+		}
+		if ele.Hardware.PrimaryBackendNetworkComponent.NetworkVlan != nil {
+			member["private_vlan_id"] = *hardware.PrimaryBackendNetworkComponent.NetworkVlan.Id
+		}
+
+		if hardware.PrimaryIpAddress != nil {
+			member["public_ipv4_address"] = *hardware.PrimaryIpAddress
+		}
+		if hardware.PrimaryBackendIpAddress != nil {
+			member["private_ipv4_address"] = *hardware.PrimaryBackendIpAddress
+		}
+		member["ipv6_enabled"] = false
+		if ele.Hardware.PrimaryNetworkComponent.PrimaryVersion6IpAddressRecord != nil {
+			member["ipv6_enabled"] = true
+			member["ipv6_address"] = *hardware.PrimaryNetworkComponent.PrimaryVersion6IpAddressRecord.IpAddress
+		}
+
+		member["private_network_only"] = *hardware.PrivateNetworkOnlyFlag
+		members[i] = member
+	}
+	return members
 }
