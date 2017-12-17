@@ -348,7 +348,13 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 	log.Printf("[INFO] Gateway ID: %s", d.Id())
 
 	member1Id := *bm.(datatypes.Hardware).Id
+	members[0]["member_id"] = member1Id
 	log.Printf("[INFO] Member 1 ID: %d", member1Id)
+
+	err = setTagsAndNotes(members[0], meta)
+	if err != nil {
+		return err
+	}
 
 	if equalConf {
 		bm, err := waitForNetworkGatewayMemberProvision(&order.Hardware[1], meta)
@@ -356,35 +362,16 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 			return fmt.Errorf(
 				"Error waiting for Gateway (%s) to become ready: %s", d.Id(), err)
 		}
-
 		member2Id := *bm.(datatypes.Hardware).Id
-
 		log.Printf("[INFO] Member 2 ID: %d", member2Id)
-		// // Set tags on member 1
-		// err = setHardwareTags(member2Id, members[1], meta)
-		// if err != nil {
-		// 	return err
-		// }
-
-		// // Set notes on member 1
-		// if d.Get("notes").(string) != "" {
-		// 	err = setHardwareNotes(member2Id, members[1], meta)
-		// 	if err != nil {
-		// 		return err
-		// 	}
-		// }
-
-	}
-
-	if v, ok := d.GetOk("associated_vlans"); ok && v.(*schema.Set).Len() > 0 {
-		associatedVlans := expandVlans(v.(*schema.Set).List(), id)
-		err := resourceIBMNetworkGatewayVlanAssociate(d, meta, associatedVlans, id)
+		members[1]["member_id"] = member2Id
+		err = setTagsAndNotes(members[1], meta)
 		if err != nil {
 			return err
 		}
-	}
 
-	return resourceIBMNetworkGatewayRead(d, meta)
+	}
+	return resourceIBMNetworkGatewayUpdate(d, meta)
 }
 
 func resourceIBMNetworkGatewayRead(d *schema.ResourceData, meta interface{}) error {
@@ -470,13 +457,14 @@ func resourceIBMNetworkGatewayRead(d *schema.ResourceData, meta interface{}) err
 		d.Set("tags", tags)
 	}
 
-	connInfo := map[string]string{"type": "ssh"}
-	if !*result.PrivateNetworkOnlyFlag && result.PrimaryIpAddress != nil {
-		connInfo["host"] = *result.PrimaryIpAddress
-	} else {
-		connInfo["host"] = *result.PrimaryBackendIpAddress
-	}
-	d.SetConnInfo(connInfo)
+	// connInfo := map[string]string{"type": "ssh"}
+	// if !*result.PrivateNetworkOnlyFlag && result.PrimaryIpAddress != nil {
+	// 	connInfo["host"] = *result.PrimaryIpAddress
+	// } else {
+	// 	connInfo["host"] = *result.PrimaryBackendIpAddress
+	// }
+	// d.SetConnInfo(connInfo)
+	// where to set it
 	d.Set("associated_vlans", resourceIBMNetworkGatewayVlanAssociatedReader(d, meta))
 
 	return nil
@@ -537,6 +525,13 @@ func resourceIBMNetworkGatewayUpdate(d *schema.ResourceData, meta interface{}) e
 				return fmt.Errorf(
 					"Error waiting for Gateway (%s) to become ready: %s", d.Id(), err)
 			}
+			id := *bm.(datatypes.Hardware).Id
+			log.Printf("[INFO] Newly added member ID: %d", id)
+			member["member_id"] = id
+			err = setTagsAndNotes(member, meta)
+			if err != nil {
+				return err
+			}
 
 		}
 
@@ -544,7 +539,7 @@ func resourceIBMNetworkGatewayUpdate(d *schema.ResourceData, meta interface{}) e
 		for _, v := range rem {
 			member := v.(gatewayMember)
 			log.Println("Removing member with ID", member.Id())
-			err := resourceIBMComputeBareMetalDelete(member, meta)
+			err := deleteHardware(member, meta)
 			if err != nil {
 				return err
 			}
@@ -577,37 +572,23 @@ func resourceIBMNetworkGatewayUpdate(d *schema.ResourceData, meta interface{}) e
 
 func resourceIBMNetworkGatewayDelete(d *schema.ResourceData, meta interface{}) error {
 	sess := meta.(ClientSession).SoftLayerSession()
-	service := services.GetHardwareService(sess)
-
 	id, err := strconv.Atoi(d.Id())
 	if err != nil {
 		return fmt.Errorf("Not a valid ID, must be an integer: %s", err)
 	}
-
-	_, err = waitForNoBareMetalActiveTransactions(id, meta)
-	if err != nil {
-		return fmt.Errorf("Error deleting Network Gateway while waiting for zero active transactions: %s", err)
+	service := services.GetNetworkGatewayService(sess)
+	gw, err := service.Id(id).Mask("members[hardwareId]").GetObject()
+	for _, v := range gw.Members {
+		m := gatewayMember{
+			"member_id": v.HardwareId,
+		}
+		err := deleteHardware(m, meta)
+		if err != nil {
+			return err
+		}
 	}
-
-	billingItem, err := service.Id(id).GetBillingItem()
-
-	if err != nil {
-		return fmt.Errorf("Error getting billing item for Network Gateway: %s", err)
-	}
-
-	if billingItem.Id == nil {
-		return fmt.Errorf("Error identifying the resource to delete, billing item is empty, please check the resource has not been deleted directly in Softlayer: %s", err)
-	}
-
-	// Monthly  Softlayer items only support an anniversary date cancellation option.
-	billingItemService := services.GetBillingItemService(sess)
-	_, err = billingItemService.Id(*billingItem.Id).CancelItem(
-		sl.Bool(false), sl.Bool(true), sl.String("No longer required"), sl.String("Please cancel this Network Gateway"),
-	)
-	if err != nil {
-		return fmt.Errorf("Error canceling the Network Gateway (%d): %s", id, err)
-	}
-
+	//If both the hardwares have been deleted then gateway will go away as well
+	d.SetId("")
 	return nil
 }
 
@@ -964,6 +945,21 @@ func resourceIBMNetworkGatewayVlanAssociatedReader(d *schema.ResourceData, meta 
 
 	return allgateways
 
+}
+
+func setTagsAndNotes(m gatewayMember, meta interface{}) error {
+	err := setHardwareTags(m["member_id"].(int), m, meta)
+	if err != nil {
+		return err
+	}
+
+	if m["notes"].(string) != "" {
+		err := setHardwareNotes(m["member_id"].(int), m, meta)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 //New types to resuse functions from other resources which does the same job

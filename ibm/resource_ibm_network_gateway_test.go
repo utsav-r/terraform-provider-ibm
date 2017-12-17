@@ -105,7 +105,7 @@ resource "ibm_network_gateway" "terraform-acceptance-test-1" {
 		  						    {"network_vlan_id" = 637374,"bypass" = true}]
 
 		  }
-`, hostname)
+`, hostname, hostname)
 }
 
 func testAccCheckIBMNetworkGatewayExists(n string, networkGateway *datatypes.Hardware) resource.TestCheckFunc {

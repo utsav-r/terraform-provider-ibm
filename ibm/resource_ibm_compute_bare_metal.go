@@ -745,7 +745,11 @@ func resourceIBMComputeBareMetalUpdate(d *schema.ResourceData, meta interface{})
 	return nil
 }
 
-func resourceIBMComputeBareMetalDelete(d dataRetriever, meta interface{}) error {
+func resourceIBMComputeBareMetalDelete(d *schema.ResourceData, meta interface{}) error {
+	return deleteHardware(d, meta)
+}
+
+func deleteHardware(d dataRetriever, meta interface{}) error {
 	sess := meta.(ClientSession).SoftLayerSession()
 	service := services.GetHardwareService(sess)
 	id, err := strconv.Atoi(d.Id())
@@ -774,7 +778,6 @@ func resourceIBMComputeBareMetalDelete(d dataRetriever, meta interface{}) error 
 
 	return nil
 }
-
 func resourceIBMComputeBareMetalExists(d *schema.ResourceData, meta interface{}) (bool, error) {
 	service := services.GetHardwareService(meta.(ClientSession).SoftLayerSession())
 
