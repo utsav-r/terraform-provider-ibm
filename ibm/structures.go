@@ -2,7 +2,6 @@ package ibm
 
 import (
 	"fmt"
-	"log"
 
 	"github.com/IBM-Bluemix/bluemix-go/api/container/containerv1"
 	"github.com/IBM-Bluemix/bluemix-go/api/iampap/iampapv1"
@@ -343,35 +342,12 @@ func flattenGatewayVlans(list []datatypes.Network_Gateway_Vlan) []map[string]int
 	return vlans
 }
 
-//We need schema.ResourceData to tell us if the user config already got members so that we can populate the right
-//members based on the member_id. This is required since we can't read back all the info of the gateway members
-//like process_key_name etc
 func flattenGatewayMembers(d *schema.ResourceData, list []datatypes.Network_Gateway_Member) []map[string]interface{} {
 	members := make([]map[string]interface{}, len(list))
-
-	membersInState := []map[string]interface{}{}
-	for _, v := range d.Get("members").(*schema.Set).List() {
-		m := v.(map[string]interface{})
-		membersInState = append(membersInState, m)
-	}
 
 	for i, ele := range list {
 		hardware := *ele.Hardware
 		member := make(map[string]interface{})
-		matchingMemberInState := map[string]interface{}{}
-		for _, v := range membersInState {
-			if v["hostname"] == *hardware.Hostname && v["domain"] == *hardware.Domain {
-				matchingMemberInState = v
-				processKeyName, ok := matchingMemberInState["process_key_name"]
-				if ok {
-					log.Println(processKeyName.(string))
-				}
-			}
-		}
-		//For values that can't be read back, leave it as it is user configuration
-		// matchingMemberInState has all the user config
-		log.Println(matchingMemberInState)
-
 		member["member_id"] = *ele.HardwareId
 		member["hostname"] = *hardware.Hostname
 		member["domain"] = *hardware.Domain
