@@ -166,20 +166,23 @@ func resourceIBMNetworkGateway() *schema.Resource {
 						},
 
 						"redundant_network": {
-							Type:     schema.TypeBool,
-							Optional: true,
-							Default:  false,
-							ForceNew: true,
+							Type:             schema.TypeBool,
+							Optional:         true,
+							Default:          false,
+							ForceNew:         true,
+							DiffSuppressFunc: applyOnce,
 						},
 						"unbonded_network": {
-							Type:     schema.TypeBool,
-							Optional: true,
-							Default:  false,
-							ForceNew: true,
+							Type:             schema.TypeBool,
+							Optional:         true,
+							Default:          false,
+							ForceNew:         true,
+							DiffSuppressFunc: applyOnce,
 						},
 						"tags": {
 							Type:     schema.TypeSet,
 							Optional: true,
+							ForceNew: true,
 							Elem:     &schema.Schema{Type: schema.TypeString},
 							Set:      schema.HashString,
 						},
@@ -304,7 +307,7 @@ func resourceIBMNetworkGateway() *schema.Resource {
 			"associated_vlans": {
 				Type:        schema.TypeSet,
 				Description: "The VLAN instances associated with this Network Gateway",
-				Optional:    true,
+				Computed:    true,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"vlan_id": {
@@ -313,14 +316,14 @@ func resourceIBMNetworkGateway() *schema.Resource {
 						},
 						"network_vlan_id": {
 							Type:        schema.TypeInt,
-							Description: "The Identifier of the VLAN to be associated",
-							Required:    true,
+							Description: "The Identifier of the VLAN which is associated",
+							Computed:    true,
 						},
 						"bypass": {
 							Type:        schema.TypeBool,
-							Description: "Indicates if the VLAN should be in bypass or routed modes",
-							Default:     true,
-							Optional:    true,
+							Description: "Indicates if the VLAN is in bypass or routed modes",
+							Default:     nil,
+							Computed:    true,
 						},
 					},
 				},
@@ -329,33 +332,23 @@ func resourceIBMNetworkGateway() *schema.Resource {
 	}
 }
 
-func hasBothMembersSameConfiguration(members []gatewayMember) bool {
-	if len(members) != 2 {
-		return false
-	}
-	m1 := members[0]
-	m2 := members[1]
-	for k, v := range m1 {
-		if k == "hostname" || k == "domain" {
-			continue
-		}
-		if !reflect.DeepEqual(v, m2[k]) {
-			return false
-		}
-	}
-	return true
-}
-
 func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) error {
 	sess := meta.(ClientSession).SoftLayerSession()
-
 	members := []gatewayMember{}
 	for _, v := range d.Get("members").([]interface{}) {
 		m := v.(map[string]interface{})
 		members = append(members, m)
 	}
+
+	if len(members) == 2 {
+		if !areVlanCompatible(members) {
+			return fmt.Errorf("Members should have exactly same public and private vlan configuration," +
+				"please check public_vlan_id and private_vlan_id property on individual members")
+		}
+	}
 	d.Partial(true)
-	// Build a montly Network gateway
+
+	//Build order for one member
 	order, err := getMonthlyGatewayOrder(members[0], meta)
 	if err != nil {
 		return fmt.Errorf(
@@ -367,9 +360,11 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 			"Encountered problem trying to configure Gateway options: %s", err)
 	}
 
-	equalConf := hasBothMembersSameConfiguration(members)
+	// two members can be ordered together if they have same hardware configuration
+	// and differ only in hostname, domain, user_metadata, post_install_script_uri etc
+	sameOrder := canBeOrderedTogether(members)
 
-	if equalConf {
+	if sameOrder {
 		//Ordering HA
 		order.Quantity = sl.Int(2)
 		order.Hardware = append(order.Hardware, datatypes.Hardware{
@@ -382,6 +377,7 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 				"Encountered problem trying to configure Gateway options: %s", err)
 		}
 	}
+	// Set SSH Key on main order
 	ssh_key_ids := d.Get("ssh_key_ids").([]interface{})
 	if len(ssh_key_ids) > 0 {
 		order.SshKeys = make([]datatypes.Container_Product_Order_SshKeys, 0, len(ssh_key_ids))
@@ -393,7 +389,7 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 			})
 		}
 	}
-
+	// Set post_install_script_uri on main order
 	if v, ok := d.GetOk("post_install_script_uri"); ok {
 		order.ProvisionScripts = []string{v.(string)}
 	}
@@ -401,12 +397,11 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 	var productOrder datatypes.Container_Product_Order
 	productOrder.OrderContainers = []datatypes.Container_Product_Order{order}
 
-	_, err = services.GetProductOrderService(sess).VerifyOrder(productOrder)
+	_, err = services.GetProductOrderService(sess).VerifyOrder(&productOrder)
 	if err != nil {
 		return fmt.Errorf(
 			"Encountered problem trying to verify the order: %s", err)
 	}
-
 	_, err = services.GetProductOrderService(sess).PlaceOrder(&productOrder, sl.Bool(false))
 	if err != nil {
 		return fmt.Errorf(
@@ -433,7 +428,8 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 		return err
 	}
 
-	if equalConf {
+	if sameOrder {
+		// If we ordered HA and then wait for other member
 		bm, err := waitForNetworkGatewayMemberProvision(&order.Hardware[1], meta)
 		if err != nil {
 			return fmt.Errorf(
@@ -461,19 +457,6 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 	if err != nil {
 		return err
 	}
-
-	if v, ok := d.GetOk("associated_vlans"); ok && v.(*schema.Set).Len() > 0 {
-		associatedVlans := expandVlans(v.(*schema.Set).List(), id)
-		err := resourceIBMNetworkGatewayVlanAssociate(d, meta, associatedVlans, id)
-		if err != nil {
-			return err
-		}
-		_, err = waitForNetworkGatewayActiveState(id, meta)
-		if err != nil {
-			return err
-		}
-	}
-	d.SetPartial("associated_vlans")
 
 	d.Partial(false)
 	return resourceIBMNetworkGatewayRead(d, meta)
@@ -538,7 +521,7 @@ func addGatewayMember(gwID int, member gatewayMember, meta interface{}) error {
 			"Encountered problem trying to configure Gateway options: %s", err)
 	}
 
-	haOrder := &datatypes.Container_Product_Order_Hardware_Server_Gateway_Appliance{}
+	haOrder := datatypes.Container_Product_Order_Hardware_Server_Gateway_Appliance{}
 	haOrder.ContainerIdentifier = order.ContainerIdentifier
 	haOrder.Hardware = order.Hardware
 	haOrder.PackageId = order.PackageId
@@ -578,35 +561,6 @@ func resourceIBMNetworkGatewayUpdate(d *schema.ResourceData, meta interface{}) e
 		if err != nil {
 			return err
 		}
-	}
-
-	if d.HasChange("associated_vlans") {
-		o, n := d.GetChange("associated_vlans")
-		os := o.(*schema.Set)
-		ns := n.(*schema.Set)
-		add := expandVlans(ns.Difference(os).List(), id)
-		if len(add) > 0 {
-			err := resourceIBMNetworkGatewayVlanAssociate(d, meta, add, id)
-			if err != nil {
-				return err
-			}
-			_, err = waitForNetworkGatewayActiveState(id, meta)
-			if err != nil {
-				return err
-			}
-		}
-		rem := expandVlans(os.Difference(ns).List(), id)
-		if len(rem) > 0 {
-			err := resourceIBMNetworkGatewayVlanDissociate(d, meta, rem, id)
-			if err != nil {
-				return err
-			}
-			_, err = waitForNetworkGatewayActiveState(id, meta)
-			if err != nil {
-				return err
-			}
-		}
-
 	}
 	return resourceIBMNetworkGatewayRead(d, meta)
 }
@@ -853,7 +807,6 @@ func getPackageByModelGateway(sess *session.Session, model string) (datatypes.Pr
 
 func setHardwareOptions(m gatewayMember, hardware *datatypes.Hardware) error {
 	public_vlan_id := m.Get("public_vlan_id").(int)
-
 	if public_vlan_id > 0 {
 		hardware.PrimaryNetworkComponent = &datatypes.Network_Component{
 			NetworkVlan: &datatypes.Network_Vlan{Id: sl.Int(public_vlan_id)},
@@ -867,13 +820,13 @@ func setHardwareOptions(m gatewayMember, hardware *datatypes.Hardware) error {
 		}
 	}
 
-	if userMetadata, ok := m.GetOk("user_metadata"); ok && len(userMetadata.(string)) > 0 {
+	if userMetadata, ok := m.GetOk("user_metadata"); ok {
 		hardware.UserData = []datatypes.Hardware_Attribute{
 			{Value: sl.String(userMetadata.(string))},
 		}
 	}
 
-	if v, ok := m.GetOk("post_install_script_uri"); ok && len(v.(string)) > 0 {
+	if v, ok := m.GetOk("post_install_script_uri"); ok {
 		hardware.PostInstallScriptUri = sl.String(v.(string))
 	}
 
@@ -1019,6 +972,7 @@ func setTagsAndNotes(m gatewayMember, meta interface{}) error {
 }
 
 //New types to resuse functions from other resources which does the same job
+//Essentially mimic schema.ResourceData get functions
 type dataRetriever interface {
 	Get(string) interface{}
 	GetOk(string) (interface{}, bool)
@@ -1036,12 +990,54 @@ func (m gatewayMember) Get(k string) interface{} {
 }
 func (m gatewayMember) GetOk(k string) (i interface{}, ok bool) {
 	i, ok = m[k]
-	if ok && k == "storage_groups" {
-		return i, len(i.([]interface{})) > 0
+	if ok {
+		if k == "storage_groups" {
+			return i, len(i.([]interface{})) > 0
+		}
+		if k == "user_metadata" || k == "post_install_script_uri" {
+			return i, len(i.(string)) > 0
+		}
 	}
 	return
 }
 
 func (m gatewayMember) Id() string {
 	return strconv.Itoa(m["member_id"].(int))
+}
+
+func areVlanCompatible(m []gatewayMember) bool {
+	if m[0]["public_vlan_id"].(int) != m[1]["public_vlan_id"].(int) {
+		return false
+	}
+	if m[0]["private_vlan_id"].(int) != m[1]["private_vlan_id"].(int) {
+		return false
+	}
+	return true
+}
+
+func canBeOrderedTogether(members []gatewayMember) bool {
+	if len(members) != 2 {
+		return false
+	}
+	m1 := members[0]
+	m2 := members[1]
+	for k, v := range m1 {
+		if k == "hostname" ||
+			k == "domain" ||
+			k == "notes" ||
+			k == "tags" ||
+			k == "public_vlan_id" ||
+			k == "private_vlan_id" ||
+			k == "user_metadata" ||
+			k == "post_install_script_uri" {
+			continue
+		}
+
+		// If other harware configurations are not equal then they can't be ordered together
+		// For example different memory
+		if !reflect.DeepEqual(v, m2[k]) {
+			return false
+		}
+	}
+	return true
 }
