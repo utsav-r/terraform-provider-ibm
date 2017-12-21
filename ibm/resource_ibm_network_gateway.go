@@ -195,10 +195,9 @@ func resourceIBMNetworkGateway() *schema.Resource {
 						},
 
 						"memory": {
-							Type:             schema.TypeInt,
-							Required:         true,
-							ForceNew:         true,
-							DiffSuppressFunc: applyOnce,
+							Type:     schema.TypeInt,
+							Required: true,
+							ForceNew: true,
 						},
 
 						"storage_groups": {
