@@ -387,9 +387,29 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 	// and differ only in hostname, domain, user_metadata, post_install_script_uri etc
 	sameOrder := canBeOrderedTogether(members)
 
+	// Set SSH Key on main order
+	ssh_key_ids := d.Get("ssh_key_ids").([]interface{})
+	if len(ssh_key_ids) > 0 {
+		order.SshKeys = make([]datatypes.Container_Product_Order_SshKeys, 0)
+		ids := make([]int, len(ssh_key_ids))
+		for i, ssh_key_id := range ssh_key_ids {
+			ids[i] = ssh_key_id.(int)
+		}
+		order.SshKeys = append(order.SshKeys, datatypes.Container_Product_Order_SshKeys{
+			SshKeyIds: ids,
+		})
+	}
+	// Set post_install_script_uri on main order
+	if v, ok := d.GetOk("post_install_script_uri"); ok {
+		order.ProvisionScripts = []string{v.(string)}
+	}
+
+	var productOrder datatypes.Container_Product_Order
+	productOrder.OrderContainers = []datatypes.Container_Product_Order{order}
+
 	if sameOrder {
 		//Ordering HA
-		order.Quantity = sl.Int(2)
+
 		order.Hardware = append(order.Hardware, datatypes.Hardware{
 			Hostname: sl.String(members[1]["hostname"].(string)),
 			Domain:   sl.String(members[1]["domain"].(string)),
@@ -399,26 +419,53 @@ func resourceIBMNetworkGatewayCreate(d *schema.ResourceData, meta interface{}) e
 			return fmt.Errorf(
 				"Encountered problem trying to configure Gateway options: %s", err)
 		}
-	}
-	// Set SSH Key on main order
-	ssh_key_ids := d.Get("ssh_key_ids").([]interface{})
-	if len(ssh_key_ids) > 0 {
-		order.SshKeys = make([]datatypes.Container_Product_Order_SshKeys, 0, len(ssh_key_ids))
-		for _, ssh_key_id := range ssh_key_ids {
-			sshKeyA := make([]int, 1)
-			sshKeyA[0] = ssh_key_id.(int)
-			order.SshKeys = append(order.SshKeys, datatypes.Container_Product_Order_SshKeys{
-				SshKeyIds: sshKeyA,
-			})
-		}
-	}
-	// Set post_install_script_uri on main order
-	if v, ok := d.GetOk("post_install_script_uri"); ok {
-		order.ProvisionScripts = []string{v.(string)}
-	}
 
-	var productOrder datatypes.Container_Product_Order
-	productOrder.OrderContainers = []datatypes.Container_Product_Order{order}
+		mSshKeys := make([]datatypes.Container_Product_Order_SshKeys, 0)
+		for _, h := range order.Hardware {
+			ids := make([]int, 0)
+			for _, id := range h.SshKeys {
+				ids = append(ids, *id.Id)
+			}
+			if len(ids) > 0 {
+				mSshKeys = append(mSshKeys, datatypes.Container_Product_Order_SshKeys{
+					SshKeyIds: ids,
+				})
+			}
+		}
+
+		productOrder = datatypes.Container_Product_Order{
+			OrderContainers: []datatypes.Container_Product_Order{
+				{ComplexType: sl.String("SoftLayer_Container_Product_Order_Hardware_Server_Gateway_Appliance"),
+					Quantity:          sl.Int(2),
+					PackageId:         order.PackageId,
+					Prices:            order.Prices,
+					Hardware:          order.Hardware,
+					Location:          order.Location,
+					ClusterIdentifier: sl.String("test"),
+				},
+				{
+					ComplexType: sl.String("SoftLayer_Container_Product_Order_Gateway_Appliance_Cluster"),
+					Quantity:    sl.Int(1),
+					//Get package ID from API
+					PackageId: sl.Int(196),
+					//Get price from API
+					Prices: []datatypes.Product_Item_Price{
+						{Id: sl.Int(37116)},
+					},
+					ClusterIdentifier: sl.String("test"),
+				},
+			},
+		}
+
+		if len(mSshKeys) > 0 {
+			productOrder.OrderContainers[0].SshKeys = mSshKeys
+		}
+
+		if len(order.SshKeys) > 0 {
+			productOrder.OrderContainers[1].SshKeys = order.SshKeys
+		}
+
+	}
 
 	_, err = services.GetProductOrderService(sess).VerifyOrder(&productOrder)
 	if err != nil {
