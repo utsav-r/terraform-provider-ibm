@@ -262,7 +262,7 @@ func resourceIBMStorageFileCreate(d *schema.ResourceData, meta interface{}) erro
 	}
 
 	// Find the storage device
-	fileStorage, err := findStorageByOrderId(sess, *receipt.OrderId)
+	fileStorage, _, err := findStorageByOrderId(sess, *receipt.OrderId, "")
 
 	if err != nil {
 		return fmt.Errorf("Error during creation of storage: %s", err)
@@ -270,7 +270,7 @@ func resourceIBMStorageFileCreate(d *schema.ResourceData, meta interface{}) erro
 	d.SetId(fmt.Sprintf("%d", *fileStorage.Id))
 
 	// Wait for storage availability
-	_, err = WaitForStorageAvailable(d, meta)
+	_, err = WaitForStorageAvailable(d, meta, "")
 
 	if err != nil {
 		return fmt.Errorf(
@@ -278,7 +278,7 @@ func resourceIBMStorageFileCreate(d *schema.ResourceData, meta interface{}) erro
 	}
 
 	// SoftLayer changes the device ID after completion of provisioning. It is necessary to refresh device ID.
-	fileStorage, err = findStorageByOrderId(sess, *receipt.OrderId)
+	fileStorage, _, err = findStorageByOrderId(sess, *receipt.OrderId, "")
 
 	if err != nil {
 		return fmt.Errorf("Error during creation of storage: %s", err)
@@ -478,10 +478,20 @@ func resourceIBMStorageFileUpdate(d *schema.ResourceData, meta interface{}) erro
 func resourceIBMStorageFileDelete(d *schema.ResourceData, meta interface{}) error {
 	sess := meta.(ClientSession).SoftLayerSession()
 	storageService := services.GetNetworkStorageService(sess)
+	var billingItem datatypes.Billing_Item
+	var err error
 	storageID, _ := strconv.Atoi(d.Id())
+	if d.Get("type") == portablestorageType {
+		billingItems, err := services.GetVirtualDiskImageService(sess).Id(storageID).GetBillingItem()
+		billingItem = billingItems.Billing_Item
+		if err != nil {
+			return fmt.Errorf("Error while looking up billing item associated with the storage: No billing item for ID:%d", storageID)
+		}
 
-	// Get billing item associated with the storage
-	billingItem, err := storageService.Id(storageID).GetBillingItem()
+	} else {
+		// Get billing item associated with the storage
+		billingItem, err = storageService.Id(storageID).GetBillingItem()
+	}
 
 	if err != nil {
 		return fmt.Errorf("Error while looking up billing item associated with the storage: %s", err)
@@ -509,10 +519,13 @@ func resourceIBMStorageFileExists(d *schema.ResourceData, meta interface{}) (boo
 	if err != nil {
 		return false, fmt.Errorf("Not a valid ID, must be an integer: %s", err)
 	}
-
-	_, err = services.GetNetworkStorageService(sess).
-		Id(storageID).
-		GetObject()
+	if d.Get("type") == portablestorageType {
+		_, err = services.GetVirtualDiskImageService(sess).Id(storageID).GetObject()
+	} else {
+		_, err = services.GetNetworkStorageService(sess).
+			Id(storageID).
+			GetObject()
+	}
 
 	if err != nil {
 		if apiErr, ok := err.(sl.Error); ok && apiErr.StatusCode == 404 {
@@ -538,14 +551,13 @@ func buildStorageProductOrderContainer(
 	if err != nil {
 		return datatypes.Container_Product_Order{}, err
 	}
-
 	// Get all prices
 	productItems, err := product.GetPackageProducts(sess, *pkg.Id, itemMask)
 	if err != nil {
 		return datatypes.Container_Product_Order{}, err
 	}
 
-	// Add IOPS price
+	var capacityPrice datatypes.Product_Item_Price
 	targetItemPrices := []datatypes.Product_Item_Price{}
 
 	if storageType == "Performance" {
@@ -608,13 +620,21 @@ func buildStorageProductOrderContainer(
 
 	}
 
+		// Add snapshot capacity price
+		if storageType == enduranceType && snapshotCapacity > 0 {
+			snapshotCapacityPrice, err := getPrice(productItems, snapshotCapacityKeyName, "storage_snapshot_space", "STORAGE_TIER_LEVEL", enduranceCapacityRestrictionMap[iops])
+			if err != nil {
+				return datatypes.Container_Product_Order{}, err
+			}
+			targetItemPrices = append(targetItemPrices, snapshotCapacityPrice)
+		}
+	}
 	// Lookup the data center ID
 	dc, err := location.GetDatacenterByName(sess, datacenter)
 	if err != nil {
 		return datatypes.Container_Product_Order{},
 			fmt.Errorf("No data centers matching %s could be found", datacenter)
 	}
-
 	productOrderContainer := datatypes.Container_Product_Order{
 		PackageId:        pkg.Id,
 		Location:         sl.String(strconv.Itoa(*dc.Id)),
@@ -626,30 +646,46 @@ func buildStorageProductOrderContainer(
 	return productOrderContainer, nil
 }
 
-func findStorageByOrderId(sess *session.Session, orderId int) (datatypes.Network_Storage, error) {
+func findStorageByOrderId(sess *session.Session, orderId int, storagetype string) (datatypes.Network_Storage, datatypes.Virtual_Disk_Image, error) {
 	filterPath := "networkStorage.billingItem.orderItem.order.id"
-
+	portablestoragefilter := "portableStorageVolumes.billingItem.orderItem.order.id"
+	var storage []datatypes.Network_Storage
+	var portablestorage []datatypes.Virtual_Disk_Image
+	var err error
 	stateConf := &resource.StateChangeConf{
 		Pending: []string{"pending"},
 		Target:  []string{"complete"},
 		Refresh: func() (interface{}, string, error) {
-			storage, err := services.GetAccountService(sess).
-				Filter(filter.Build(
-					filter.Path(filterPath).
-						Eq(strconv.Itoa(orderId)))).
-				Mask(storageMask).
-				GetNetworkStorage()
-			if err != nil {
-				return datatypes.Network_Storage{}, "", err
+			if storagetype != portablestorageType {
+				storage, err = services.GetAccountService(sess).
+					Filter(filter.Build(
+						filter.Path(filterPath).
+							Eq(strconv.Itoa(orderId)))).
+					Mask(storageMask).
+					GetNetworkStorage()
+				if err != nil {
+					return datatypes.Network_Storage{}, "", err
+				}
+			} else {
+				portablestorage, err = services.GetAccountService(sess).
+					Filter(filter.Build(
+						filter.Path(portablestoragefilter).
+							Eq(strconv.Itoa(orderId)))).
+					Mask(storageMask).
+					GetPortableStorageVolumes()
+				if err != nil {
+					return datatypes.Network_Storage{}, "", err
+				}
 			}
-
 			if len(storage) == 1 {
 				return storage[0], "complete", nil
-			} else if len(storage) == 0 {
+			} else if len(portablestorage) == 1 {
+				fmt.Println("----------------------------Finally Found it-------------------------")
+				return portablestorage[0], "complete", nil
+			} else if len(storage) == 0 || len(portablestorage) == 0 {
 				return nil, "pending", nil
-			} else {
-				return nil, "", fmt.Errorf("Expected one Storage: %s", err)
 			}
+			return nil, "", fmt.Errorf("Expected one Storage: %s", err)
 		},
 		Timeout:        45 * time.Minute,
 		Delay:          10 * time.Second,
@@ -660,21 +696,28 @@ func findStorageByOrderId(sess *session.Session, orderId int) (datatypes.Network
 	pendingResult, err := stateConf.WaitForState()
 
 	if err != nil {
-		return datatypes.Network_Storage{}, err
+		return datatypes.Network_Storage{}, datatypes.Virtual_Disk_Image{}, err
 	}
 
 	var result, ok = pendingResult.(datatypes.Network_Storage)
-
-	if ok {
-		return result, nil
+	if storagetype == portablestorageType {
+		if result, ok := pendingResult.(datatypes.Virtual_Disk_Image); ok {
+			return datatypes.Network_Storage{}, result, nil
+		}
+		return datatypes.Network_Storage{}, datatypes.Virtual_Disk_Image{},
+			fmt.Errorf("Cannot find Storage with order id from line 856 '%d'", orderId)
 	}
 
-	return datatypes.Network_Storage{},
+	if ok {
+		return result, datatypes.Virtual_Disk_Image{}, nil
+	}
+
+	return datatypes.Network_Storage{}, datatypes.Virtual_Disk_Image{},
 		fmt.Errorf("Cannot find Storage with order id '%d'", orderId)
 }
 
 // Waits for storage provisioning
-func WaitForStorageAvailable(d *schema.ResourceData, meta interface{}) (interface{}, error) {
+func WaitForStorageAvailable(d *schema.ResourceData, meta interface{}, storagetype string) (interface{}, error) {
 	log.Printf("Waiting for storage (%s) to be available.", d.Id())
 	id, err := strconv.Atoi(d.Id())
 	if err != nil {
