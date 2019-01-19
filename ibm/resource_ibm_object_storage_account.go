@@ -3,8 +3,8 @@ package ibm
 import (
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
+
 	"time"
 
 	"github.com/hashicorp/terraform/helper/resource"
@@ -12,19 +12,8 @@ import (
 	"github.com/softlayer/softlayer-go/datatypes"
 	"github.com/softlayer/softlayer-go/filter"
 	"github.com/softlayer/softlayer-go/helpers/order"
-	"github.com/softlayer/softlayer-go/helpers/product"
 	"github.com/softlayer/softlayer-go/services"
 	"github.com/softlayer/softlayer-go/sl"
-)
-
-const (
-	filterPath                  = "networkStorage.billingItem.orderItemId"
-	objectMask                  = "id,username,billingItem[id,orderItemId]"
-	packageObjectMask           = "id,name,description,isActive,type[keyName]"
-	objectStoragePackageKeyname = "OBJECT_STORAGE"
-	objectStorageMask           = "id,capacity,description,units,keyName,prices[id,categories[id,name,categoryCode]]"
-	s3                          = "CLOUD_OBJECT_STORAGE"
-	swift                       = "OBJECT_STORAGE_PAY_AS_YOU_GO"
 )
 
 func resourceIBMObjectStorageAccount() *schema.Resource {
@@ -40,11 +29,6 @@ func resourceIBMObjectStorageAccount() *schema.Resource {
 			"name": &schema.Schema{
 				Type:     schema.TypeString,
 				Computed: true,
-			},
-			"accountType": &schema.Schema{
-				Type:     schema.TypeString,
-				Default:  "SWIFT",
-				Optional: true,
 			},
 			"local_note": &schema.Schema{
 				Type:     schema.TypeString,
@@ -62,94 +46,55 @@ func resourceIBMObjectStorageAccount() *schema.Resource {
 
 func resourceIBMObjectStorageAccountCreate(d *schema.ResourceData, meta interface{}) error {
 	sess := meta.(ClientSession).SoftLayerSession()
-	service := services.GetProductPackageService(sess)
-	packages, err := service.
-		Mask(packageObjectMask).
-		Filter(
-			filter.Build(
-				filter.Path("keyName").Eq(objectStoragePackageKeyname),
-			),
-		).
-		Limit(1).
-		GetAllObjects()
+	accountService := services.GetAccountService(sess)
+
+	// Check if an object storage account exists
+	objectStorageAccounts, err := accountService.GetHubNetworkStorage()
 	if err != nil {
-		return fmt.Errorf(
-			"resource_ibm_object_storage_account: Error ordering object storage account: %s", err)
-	}
-	ObjectStorages, err := product.GetPackageProducts(sess, *packages[0].Id, objectStorageMask)
-	if err != nil {
-		return fmt.Errorf(
-			"resource_ibm_object_storage_account: Error ordering object storage account: %s", err)
+		return fmt.Errorf("resource_ibm_object_storage_account: Error on create: %s", err)
 	}
 
-	if len(ObjectStorages) == 0 {
-		return fmt.Errorf(
-			"resource_ibm_object_storage_account: Error getting Package Data: %s", err)
-	}
-	// Order the account
-	productOrderService := services.GetProductOrderService(sess.SetRetries(0))
+	if len(objectStorageAccounts) == 0 {
+		// Order the account
+		productOrderService := services.GetProductOrderService(sess.SetRetries(0))
 
-	itemPriceID := sl.Int(*ObjectStorages[0].Prices[0].Id)
-	accountType := d.Get("accountType").(string)
-	keyName := swift
-	switch accountType {
-	case "SWIFT":
-		keyName = swift
-	case "S3":
-		keyName = s3
-	default:
-		return fmt.Errorf("Error during creation of storage: Invalid accountType %s", accountType)
-	}
+		receipt, err := productOrderService.PlaceOrder(&datatypes.Container_Product_Order{
+			Quantity:  sl.Int(1),
+			PackageId: sl.Int(0),
+			Prices: []datatypes.Product_Item_Price{
+				{Id: sl.Int(30920)},
+			},
+		}, sl.Bool(false))
+		if err != nil {
+			return fmt.Errorf(
+				"resource_ibm_object_storage_account: Error ordering account: %s", err)
+		}
 
-	for _, ObjectStorage := range ObjectStorages {
-		if *ObjectStorage.KeyName == keyName {
-			itemPriceID = sl.Int(*ObjectStorage.Prices[0].Id)
+		// Wait for the object storage account order to complete.
+		billingOrderItem, err := WaitForOrderCompletion(&receipt, meta)
+		if err != nil {
+			return fmt.Errorf(
+				"Error waiting for object storage account order (%d) to complete: %s", receipt.OrderId, err)
+		}
+
+		// Get accountName using filter on hub network storage
+		objectStorageAccounts, err = accountService.Filter(
+			filter.Path("billingItem.id").Eq(billingOrderItem.BillingItem.Id).Build(),
+		).GetNetworkStorage()
+		if err != nil {
+			return fmt.Errorf("resource_ibm_object_storage_account: Error on retrieving new: %s", err)
+		}
+
+		if len(objectStorageAccounts) == 0 {
+			return fmt.Errorf("resource_ibm_object_storage_account: Failed to create object storage account.")
 		}
 	}
 
-	productOrderContainer := datatypes.Container_Product_Order{
-		PackageId: sl.Int(*packages[0].Id),
-		Prices: []datatypes.Product_Item_Price{
-			{
-				Id: itemPriceID,
-			},
-		},
-		Quantity: sl.Int(1),
-	}
-	receipt, err := productOrderService.PlaceOrder(&productOrderContainer, sl.Bool(false))
-	if err != nil {
-		return fmt.Errorf(
-			"resource_ibm_object_storage_account: Error ordering object storage: %s", err)
-	}
-
-	// Wait for the object storage account order to complete.
-	_, err = WaitForOrderCompletion(&receipt, meta)
-	if err != nil {
-		return fmt.Errorf(
-			"Error waiting for object storage account order (%d) to complete: %s", receipt.OrderId, err)
-	}
-
-	objectStorageAccounts, err := services.GetAccountService(sess).
-		Filter(filter.Build(
-			filter.Path(filterPath).
-				Eq(strconv.Itoa(*receipt.PlacedOrder.Items[0].Id)))).
-		Mask(objectMask).GetNetworkStorage()
-
-	if err != nil {
-		return fmt.Errorf("resource_ibm_object_storage_account: Error on retrieving new: %s", err)
-	}
-
-	if len(objectStorageAccounts) != 1 {
-		return fmt.Errorf("resource_ibm_object_storage_account: Expected one object storage account.")
-	}
-
-	log.Printf("[INFO] Storage Account ID: %s", d.Id())
-	log.Printf("[INFO] Storage Account Name: %s", *objectStorageAccounts[0].Username)
-
-	d.SetId(fmt.Sprintf("%d", *objectStorageAccounts[0].Id))
+	// Get account name and set as the Id
+	d.SetId(*objectStorageAccounts[0].Username)
 	d.Set("name", *objectStorageAccounts[0].Username)
 
-	return resourceIBMObjectStorageAccountRead(d, meta)
+	return nil
 }
 
 func WaitForOrderCompletion(
@@ -187,26 +132,25 @@ func WaitForOrderCompletion(
 
 func resourceIBMObjectStorageAccountRead(d *schema.ResourceData, meta interface{}) error {
 	sess := meta.(ClientSession).SoftLayerSession()
-	storageAccountID, _ := strconv.Atoi(d.Id())
+	accountService := services.GetAccountService(sess)
+	accountName := d.Id()
+	d.Set("name", accountName)
 
-	objectStorageAccounts, err := services.GetAccountService(sess).
-		Filter(filter.Build(
-			filter.Path("id").Eq(storageAccountID))).
-		Mask(objectMask).GetNetworkStorage()
-
+	// Check if an object storage account exists
+	objectStorageAccounts, err := accountService.Filter(
+		filter.Path("username").Eq(accountName).Build(),
+	).GetHubNetworkStorage()
 	if err != nil {
 		return fmt.Errorf("resource_ibm_object_storage_account: Error on Read: %s", err)
 	}
 
 	for _, objectStorageAccount := range objectStorageAccounts {
-		if *objectStorageAccount.Id == storageAccountID {
-			log.Printf("[INFO] Found Storage Account ID: %s", d.Id())
-			d.Set("username", *objectStorageAccount.Username)
+		if *objectStorageAccount.Username == accountName {
 			return nil
 		}
 	}
 
-	return fmt.Errorf("resource_ibm_object_storage_account: Could not find account %s", d.Id())
+	return fmt.Errorf("resource_ibm_object_storage_account: Could not find account %s", accountName)
 }
 
 func resourceIBMObjectStorageAccountUpdate(d *schema.ResourceData, meta interface{}) error {
@@ -215,29 +159,7 @@ func resourceIBMObjectStorageAccountUpdate(d *schema.ResourceData, meta interfac
 }
 
 func resourceIBMObjectStorageAccountDelete(d *schema.ResourceData, meta interface{}) error {
-	sess := meta.(ClientSession).SoftLayerSession()
-	storageService := services.GetNetworkStorageService(sess)
-	storageID, _ := strconv.Atoi(d.Id())
-
-	// Get billing item associated with the object storage account
-	billingItem, err := storageService.Id(storageID).GetBillingItem()
-
-	if err != nil {
-		return fmt.Errorf("Error while looking up billing item associated with the object storage account: %s", err)
-	}
-
-	if billingItem.Id == nil {
-		return fmt.Errorf("Error while looking up billing item associated with the object storage account: No billing item for ID:%d", storageID)
-	}
-
-	success, err := services.GetBillingItemService(sess).Id(*billingItem.Id).CancelService()
-	if err != nil {
-		return err
-	}
-
-	if !success {
-		return fmt.Errorf("SoftLayer reported an unsuccessful cancellation")
-	}
+	// Delete is not supported for now.
 	return nil
 }
 

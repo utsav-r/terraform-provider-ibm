@@ -10,7 +10,6 @@ import (
 
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/softlayer/softlayer-go/datatypes"
-	"github.com/softlayer/softlayer-go/filter"
 	"github.com/softlayer/softlayer-go/helpers/network"
 	"github.com/softlayer/softlayer-go/services"
 	"github.com/softlayer/softlayer-go/sl"
@@ -46,7 +45,7 @@ func resourceIBMStorageBlock() *schema.Resource {
 
 			"iops": {
 				Type:     schema.TypeFloat,
-				Optional: true,
+				Required: true,
 				ForceNew: true,
 			},
 
@@ -60,11 +59,6 @@ func resourceIBMStorageBlock() *schema.Resource {
 				Computed: true,
 			},
 
-			"disk_description": {
-				Type:     schema.TypeString,
-				Optional: true,
-				ForceNew: true,
-			},
 			"snapshot_capacity": {
 				Type:     schema.TypeInt,
 				Optional: true,
@@ -73,7 +67,7 @@ func resourceIBMStorageBlock() *schema.Resource {
 
 			"os_format_type": {
 				Type:     schema.TypeString,
-				Optional: true,
+				Required: true,
 				ForceNew: true,
 			},
 
@@ -212,34 +206,19 @@ func resourceIBMStorageBlockCreate(d *schema.ResourceData, meta interface{}) err
 	sess := meta.(ClientSession).SoftLayerSession()
 
 	storageType := d.Get("type").(string)
-	var iops float64
-	var err error
-	var diskdescription string
-	var osFormatType string
-	if _, ok := d.GetOk("disk_description"); ok {
-		diskdescription = d.Get("disk_description").(string)
-	}
-	if _, ok := d.GetOk("iops"); ok {
-		iops = d.Get("iops").(float64)
-	}
+	iops := d.Get("iops").(float64)
 	datacenter := d.Get("datacenter").(string)
 	capacity := d.Get("capacity").(int)
 	snapshotCapacity := d.Get("snapshot_capacity").(int)
-	var osType datatypes.Network_Storage_Iscsi_OS_Type
-	if _, ok := d.GetOk("os_format_type"); ok {
-		osFormatType = d.Get("os_format_type").(string)
-		osType, err = network.GetOsTypeByName(sess, osFormatType)
-	}
+	osFormatType := d.Get("os_format_type").(string)
+	osType, err := network.GetOsTypeByName(sess, osFormatType)
 	hourlyBilling := d.Get("hourly_billing").(bool)
+
 	if err != nil {
 		return err
 	}
-	var storageOrderContainer datatypes.Container_Product_Order
-	if storageType == "Portable" {
-		storageOrderContainer, err = buildStorageProductOrderContainer(sess, storageType, 0.00, capacity, snapshotCapacity, blockStorage, datacenter, hourlyBilling)
-	} else {
-		storageOrderContainer, err = buildStorageProductOrderContainer(sess, storageType, iops, capacity, snapshotCapacity, blockStorage, datacenter, hourlyBilling)
-	}
+
+	storageOrderContainer, err := buildStorageProductOrderContainer(sess, storageType, iops, capacity, snapshotCapacity, blockStorage, datacenter, hourlyBilling)
 	if err != nil {
 		return fmt.Errorf("Error while creating storage:%s", err)
 	}
@@ -270,12 +249,6 @@ func resourceIBMStorageBlockCreate(d *schema.ResourceData, meta interface{}) err
 				Iops:       sl.Int(int(iops)),
 				VolumeSize: &capacity,
 			}, sl.Bool(false))
-	case portableType:
-		receipt, err = services.GetProductOrderService(sess.SetRetries(0)).PlaceOrder(
-			&datatypes.Container_Product_Order_Virtual_Disk_Image{
-				Container_Product_Order: storageOrderContainer,
-				DiskDescription:         &diskdescription,
-			}, sl.Bool(false))
 	default:
 		return fmt.Errorf("Error during creation of storage: Invalid storageType %s", storageType)
 	}
@@ -285,26 +258,15 @@ func resourceIBMStorageBlockCreate(d *schema.ResourceData, meta interface{}) err
 	}
 
 	// Find the storage device
-	var blockStorage datatypes.Network_Storage
-	var portablestorage datatypes.Virtual_Disk_Image
-	if storageType != portablestorageType {
-		blockStorage, _, err = findStorageByOrderId(sess, *receipt.OrderId, "")
-	} else {
-		_, portablestorage, err = findStorageByOrderId(sess, *receipt.OrderId, portablestorageType)
-	}
+	blockStorage, err := findStorageByOrderId(sess, *receipt.OrderId)
+
 	if err != nil {
 		return fmt.Errorf("Error during creation of storage: %s", err)
 	}
-	if storageType != portablestorageType {
-		d.SetId(fmt.Sprintf("%d", *blockStorage.Id))
-	} else {
-		d.SetId(fmt.Sprintf("%d", *portablestorage.Id))
-	}
+	d.SetId(fmt.Sprintf("%d", *blockStorage.Id))
 
 	// Wait for storage availability
-	if storageType != portablestorageType {
-		_, err = WaitForStorageAvailable(d, meta, "")
-	}
+	_, err = WaitForStorageAvailable(d, meta)
 
 	if err != nil {
 		return fmt.Errorf(
@@ -312,114 +274,54 @@ func resourceIBMStorageBlockCreate(d *schema.ResourceData, meta interface{}) err
 	}
 
 	// SoftLayer changes the device ID after completion of provisioning. It is necessary to refresh device ID.
-	if storageType != portablestorageType {
-		blockStorage, _, err = findStorageByOrderId(sess, *receipt.OrderId, "")
-	} else {
-		_, portablestorage, err = findStorageByOrderId(sess, *receipt.OrderId, portablestorageType)
-	}
+	blockStorage, err = findStorageByOrderId(sess, *receipt.OrderId)
 
 	if err != nil {
 		return fmt.Errorf("Error during creation of storage: %s", err)
 	}
-	if storageType != portablestorageType {
-		d.SetId(fmt.Sprintf("%d", *blockStorage.Id))
-	} else {
-		d.SetId(fmt.Sprintf("%d", *portablestorage.Id))
-	}
+	d.SetId(fmt.Sprintf("%d", *blockStorage.Id))
 
 	log.Printf("[INFO] Storage ID: %s", d.Id())
 
-	if storageType != portablestorageType {
-		return resourceIBMStorageBlockUpdate(d, meta)
-	}
-	return resourceIBMStorageBlockRead(d, meta)
+	return resourceIBMStorageBlockUpdate(d, meta)
 }
 
 func resourceIBMStorageBlockRead(d *schema.ResourceData, meta interface{}) error {
 	sess := meta.(ClientSession).SoftLayerSession()
 	storageId, _ := strconv.Atoi(d.Id())
-	var err error
-	portablestoragefilter := "portableStorageVolumes.id"
-	var portablestorage []datatypes.Virtual_Disk_Image
-	if d.Get("type") == portablestorageType {
-		portablestorage, err = services.GetAccountService(sess).
-			Filter(filter.Build(
-				filter.Path(portablestoragefilter).
-					Eq(strconv.Itoa(storageId)))).
-			GetPortableStorageVolumes()
-		if err != nil {
-			return fmt.Errorf("Error during fetching details of storage: %s", err)
-		}
-		d.Set("type", "Portable")
-		d.Set("capacity", *portablestorage[0].Capacity)
-		d.Set("volumename", *portablestorage[0].Description)
-	} else {
-		storage, err := services.GetNetworkStorageService(sess).
-			Id(storageId).
-			Mask(storageDetailMask).
-			GetObject()
 
-		storageType := strings.Fields(*storage.StorageType.Description)[0]
+	storage, err := services.GetNetworkStorageService(sess).
+		Id(storageId).
+		Mask(storageDetailMask).
+		GetObject()
 
-		// Calculate IOPS
-		iops, err := getIops(storage, storageType)
-		if err != nil {
-			return fmt.Errorf("Error retrieving storage information: %s", err)
-		}
+	if err != nil {
+		return fmt.Errorf("Error retrieving storage information: %s", err)
+	}
 
-		d.Set("type", storageType)
-		d.Set("capacity", *storage.CapacityGb)
-		d.Set("volumename", *storage.Username)
-		d.Set("hostname", *storage.ServiceResourceBackendIpAddress)
-		d.Set("iops", iops)
-		if storage.SnapshotCapacityGb != nil {
-			snapshotCapacity, _ := strconv.Atoi(*storage.SnapshotCapacityGb)
-			d.Set("snapshot_capacity", snapshotCapacity)
-		}
+	storageType := strings.Fields(*storage.StorageType.Description)[0]
 
-		// Parse data center short name from ServiceResourceName. For example,
-		// if SoftLayer API returns "'serviceResourceName': 'PerfStor Aggr aggr_staasdal0601_p01'",
-		// the data center short name is "dal06".
-		r, _ := regexp.Compile("[a-zA-Z]{3}[0-9]{2}")
-		d.Set("datacenter", r.FindString(*storage.ServiceResourceName))
+	// Calculate IOPS
+	iops, err := getIops(storage, storageType)
+	if err != nil {
+		return fmt.Errorf("Error retrieving storage information: %s", err)
+	}
 
-		// Read allowed_ip_addresses
-		allowedIpaddressesList := make([]string, 0, len(storage.AllowedIpAddresses))
-		for _, allowedIpaddress := range storage.AllowedIpAddresses {
-			allowedIpaddressesList = append(allowedIpaddressesList, *allowedIpaddress.IpAddress)
-		}
-		d.Set("allowed_ip_addresses", allowedIpaddressesList)
+	d.Set("type", storageType)
+	d.Set("capacity", *storage.CapacityGb)
+	d.Set("volumename", *storage.Username)
+	d.Set("hostname", *storage.ServiceResourceBackendIpAddress)
+	d.Set("iops", iops)
+	if storage.SnapshotCapacityGb != nil {
+		snapshotCapacity, _ := strconv.Atoi(*storage.SnapshotCapacityGb)
+		d.Set("snapshot_capacity", snapshotCapacity)
+	}
 
-		// Read allowed_virtual_guest_ids and allowed_virtual_guest_info
-		allowedVirtualGuestInfoList := make([]map[string]interface{}, 0)
-		allowedVirtualGuestIdsList := make([]int, 0, len(storage.AllowedVirtualGuests))
-
-		for _, allowedVirtualGuest := range storage.AllowedVirtualGuests {
-			singleVirtualGuest := make(map[string]interface{})
-			singleVirtualGuest["id"] = *allowedVirtualGuest.Id
-			singleVirtualGuest["username"] = *allowedVirtualGuest.AllowedHost.Credential.Username
-			singleVirtualGuest["password"] = *allowedVirtualGuest.AllowedHost.Credential.Password
-			singleVirtualGuest["host_iqn"] = *allowedVirtualGuest.AllowedHost.Name
-			allowedVirtualGuestInfoList = append(allowedVirtualGuestInfoList, singleVirtualGuest)
-			allowedVirtualGuestIdsList = append(allowedVirtualGuestIdsList, *allowedVirtualGuest.Id)
-		}
-		d.Set("allowed_virtual_guest_ids", allowedVirtualGuestIdsList)
-		d.Set("allowed_virtual_guest_info", allowedVirtualGuestInfoList)
-
-		// Read allowed_hardware_ids and allowed_hardware_info
-		allowedHardwareInfoList := make([]map[string]interface{}, 0)
-		allowedHardwareIdsList := make([]int, 0, len(storage.AllowedHardware))
-		for _, allowedHW := range storage.AllowedHardware {
-			singleHardware := make(map[string]interface{})
-			singleHardware["id"] = *allowedHW.Id
-			singleHardware["username"] = *allowedHW.AllowedHost.Credential.Username
-			singleHardware["password"] = *allowedHW.AllowedHost.Credential.Password
-			singleHardware["host_iqn"] = *allowedHW.AllowedHost.Name
-			allowedHardwareInfoList = append(allowedHardwareInfoList, singleHardware)
-			allowedHardwareIdsList = append(allowedHardwareIdsList, *allowedHW.Id)
-		}
-		d.Set("allowed_hardware_ids", allowedHardwareIdsList)
-		d.Set("allowed_hardware_info", allowedHardwareInfoList)
+	// Parse data center short name from ServiceResourceName. For example,
+	// if SoftLayer API returns "'serviceResourceName': 'PerfStor Aggr aggr_staasdal0601_p01'",
+	// the data center short name is "dal06".
+	r, _ := regexp.Compile("[a-zA-Z]{3}[0-9]{2}")
+	d.Set("datacenter", r.FindString(*storage.ServiceResourceName))
 
 	allowedHostInfoList := make([]map[string]interface{}, 0)
 
@@ -470,16 +372,18 @@ func resourceIBMStorageBlockRead(d *schema.ResourceData, meta interface{}) error
 	d.Set("allowed_hardware_info", allowedHardwareInfoList)
 	d.Set("allowed_host_info", allowedHostInfoList)
 
-		if storage.Notes != nil {
-			d.Set("notes", *storage.Notes)
-		}
-
-		if storage.BillingItem != nil {
-			d.Set("hourly_billing", storage.BillingItem.HourlyFlag)
-		}
-
-		return nil
+	if storage.OsType != nil {
+		d.Set("os_format_type", *storage.OsType.Name)
 	}
+
+	if storage.Notes != nil {
+		d.Set("notes", *storage.Notes)
+	}
+
+	if storage.BillingItem != nil {
+		d.Set("hourly_billing", storage.BillingItem.HourlyFlag)
+	}
+
 	return nil
 }
 
